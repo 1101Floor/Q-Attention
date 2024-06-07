@@ -1,0 +1,239 @@
+from tqdm import tqdm  
+import tensorflow as tf
+
+# gpus = tf.config.experimental.list_physical_devices('GPU')
+# tf.config.experimental.set_memory_growth(gpus[0],True)
+
+class Qattention(tf.keras.layers.Layer):
+    """Q-learning"""
+    def __init__(self, q, k, epsilon, alpha, gamma, y_label, num, n_action=3, num_class=10):
+        super().__init__()
+        self.q, self.k, self.y_label = q, k, y_label
+        self.x, self.y = q.shape[-2] - 1, k.shape[-2] - 1
+        self.n_action = n_action
+        self.batch_size = q.shape[0] 
+        self.Q_table = tf.zeros(shape=[q.shape[0], q.shape[-2] * k.shape[-2], n_action], dtype='float32')    
+        self.alpha = alpha  
+        self.gamma = gamma  
+        self.epsilon = epsilon 
+        self.num_class = num_class
+        self.btach_tensor = tf.reshape(tf.cast(tf.linspace([0, ], [q.shape[0]-1, ], q.shape[0]), dtype=tf.int32)
+                                        , shape=(tf.linspace([0, ], [q.shape[0]-1, ], q.shape[0]).shape[0], 1))
+        self.dq = tf.keras.layers.Dense(128)
+        self.dk = tf.keras.layers.Dense(128)
+        self.dv = tf.keras.layers.Dense(128)
+        self.numclass = tf.keras.layers.Dense(self.num_class, activation='softmax')
+        
+        self.num = num
+        self.zeros__ = tf.zeros(shape=(self.Q_table.shape[0], self.Q_table.shape[1], self.Q_table.shape[2])
+                            , dtype=tf.float32)
+
+    def NNetworks(self, next_s = None):
+        q = self.dq(self.q)
+        k = self.dk(self.k)
+        if next_s is None:
+            init_score = tf.matmul(q, k, transpose_b=True) / tf.math.sqrt(float(self.k.shape[1]))
+            init_score = self.softmax(init_score, T=1)
+        else:
+            init_score = next_s
+        init_att_values = tf.matmul(init_score, self.dv(self.k))
+        init_y_predict = tf.reshape(init_att_values
+                                    , shape=(-1, init_att_values.shape[1] * init_att_values.shape[2]))
+        y_predict = self.numclass(init_y_predict)
+
+        return y_predict, init_score
+
+    def delre(self, data): 
+        num = 0
+        for i in range(data.shape[0]):
+            if tf.unique(data[i, :])[0].shape[0] == self.Q_table.shape[-2]:
+                num += 1
+            else:
+                break
+        if num == self.Q_table.shape[0]:
+            a = 1
+        else:
+            a = 0
+        return a
+    
+    def softmax(self, x, T):
+
+        x_exp = tf.math.exp(tf.divide(x, T))
+        x_sum = tf.reshape(tf.reduce_sum(x_exp, axis=2), shape=(-1, x_exp.shape[1], 1))
+        s = tf.divide(x_exp, x_sum) 
+        return s
+        
+    def initstate(self):
+        self.x = tf.random.uniform(shape=(self.q.shape[0], 1), minval=0, maxval=self.q.shape[-2], dtype=tf.int32)
+        self.y = tf.random.uniform(shape=(self.q.shape[0], 1), minval=0, maxval=self.k.shape[-2], dtype=tf.int32)
+        action_index = tf.random.uniform(shape=(0,), minval=-1, maxval=0, dtype=tf.int32)
+        action_init = tf.random.uniform(shape=(self.q.shape[0], 1), minval=0, maxval=1, dtype=tf.int32)
+        return self.x * self.q.shape[-2] + self.y, self.x, self.y, action_index, action_init
+    
+    def init_loss(self):
+        
+        init_y_predict, init_score = self.NNetworks()
+        init_loss = tf.keras.metrics.sparse_categorical_crossentropy(self.y_label,  init_y_predict)
+        loss = tf.keras.metrics.sparse_categorical_accuracy(self.y_label,  init_y_predict)
+        return init_score, init_loss, loss
+        
+    def reward(self, action, x, y, init_score, init_loss, action_index): 
+        zeros_ = tf.zeros(shape=(init_score.shape[0], init_score.shape[1], init_score.shape[2]))
+        indecies = tf.concat([self.btach_tensor, x, y], axis=1)
+        updates = tf.reshape(tf.cast(action, dtype=tf.float32) * self.num, shape=(-1,)) #num_
+        updata_zero = tf.tensor_scatter_nd_update(zeros_, indecies, updates)
+
+        next_score = updata_zero + init_score
+        next_score = self.softmax(next_score, T=1)
+        if tf.size(action_index) == 0:
+            pass
+        else:
+            next_score = tf.tensor_scatter_nd_update(next_score, indices=action_index
+                                                      , updates=tf.gather_nd(init_score, action_index))
+        
+        y_predict, __ = self.NNetworks(next_s = next_score)
+        next_loss = tf.keras.metrics.sparse_categorical_crossentropy(self.y_label, y_predict)
+        next_loss_ = tf.keras.metrics.sparse_categorical_accuracy(self.y_label,  y_predict)
+        _, loss_, loss = self.init_loss()
+        
+        greater_equal = tf.less(next_loss - loss_, 0)
+        greater_equal_ = tf.equal(next_loss, loss_)
+        equal_index = tf.cast(tf.where(greater_equal_), dtype=tf.int32)
+        if tf.size(action_index) == 0:
+            action_index = tf.cast(tf.where(greater_equal), dtype=tf.int32)
+        else:
+            tran_tensor = tf.concat([action_index, tf.cast(tf.where(greater_equal), dtype=tf.int32)], axis=0)
+            tran_tensor = tf.reshape(tran_tensor, shape=(tran_tensor.shape[0],))
+            action_index = tf.unique(tran_tensor).y
+            action_index = tf.reshape(action_index, shape=(action_index.shape[0], 1))
+
+        reward_less = tf.constant(100, shape=(greater_equal.shape[0], 1))
+        reward_big = tf.constant(-1, shape=(greater_equal.shape[0], 1))
+        reward_equal = tf.constant(0, shape=(equal_index.shape[0], 1))
+        greater_equal = tf.reshape(greater_equal, shape=(greater_equal.shape[0], 1))
+        reward__ = tf.where(greater_equal, reward_less, reward_big)
+        reward__ = tf.tensor_scatter_nd_update(reward__, indices=equal_index, updates=reward_equal)
+        
+        reward__ = tf.reshape(tf.cast(reward__, dtype=tf.float32), shape=(reward__.shape[0],))
+        mean_loss = next_loss_# tf.reduce_sum(next_loss_)# / next_loss_.shape[0]
+        # init_acc = tf.reduce_sum(loss) / next_loss_.shape[0]
+        print(action_index.shape[0])
+        done = False
+        if action_index.shape[0] >= tf.cast(self.q.shape[0], tf.int32):
+            done = True
+        else:
+            pass
+        
+        return reward__, next_score, next_loss, action_index, mean_loss, done
+
+    def getstate(self, state0, action_index, x, y): # statenum,
+    
+        state_ = state0
+        sta_ = False
+        while not sta_:  
+            if tf.reduce_sum(tf.cast(tf.equal(state0, state_), dtype=tf.int32)) == state_.shape[0]:
+                # print('here')
+                self.x = tf.random.uniform(shape=(self.q.shape[0], 1), minval=0, maxval=self.q.shape[-2], dtype=tf.int32)
+                self.y = tf.random.uniform(shape=(self.q.shape[0], 1), minval=0, maxval=self.k.shape[-2], dtype=tf.int32)
+                if tf.size(action_index) == 0:
+                    # print('*****************')
+                    state_ = self.x * self.q.shape[-2] + self.y
+                else:
+                    # print('+++++++++++++++++')
+                    _x = tf.gather_nd(x, action_index)
+                    _y = tf.gather_nd(y, action_index)
+                    self.x = tf.tensor_scatter_nd_update(self.x, indices=action_index, updates=_x)
+                    self.y = tf.tensor_scatter_nd_update(self.y, indices=action_index, updates=_y)
+                    state_ = self.x * self.q.shape[-2] + self.y
+            else:
+                if tf.size(action_index) == 0:
+                    next_state = state_
+                else:
+                    _state = tf.gather_nd(state0, action_index)
+                    next_state = tf.tensor_scatter_nd_update(state_, indices=action_index, updates=_state)
+
+                sta_ = True  
+        # statenum = tf.concat([statenum, next_state], axis=1)
+        return next_state, self.x, self.y#, statenum#, done
+    
+    def take_action(self, state, action_index, action_init):
+        
+        random_num = tf.random.uniform(shape=(self.q.shape[0], 1), minval=0, maxval=1, dtype=tf.float32)
+        greater_equal = tf.less(random_num, self.epsilon)
+        random_action = tf.random.uniform(shape=(self.q.shape[0], 1), minval=-1, maxval=2, dtype=tf.int32)
+        
+        Q_table_state = tf.gather_nd(self.Q_table, tf.concat([self.btach_tensor, state], axis=1))
+        max_action = tf.cast(tf.argmax(Q_table_state, axis=1), dtype=tf.int32) 
+        max_action = max_action - tf.ones(shape=(self.q.shape[0],), dtype=tf.int32)
+        max_action = tf.reshape(max_action, shape=(max_action.shape[0], 1))
+        
+        action = tf.where(greater_equal, random_action, max_action)
+        aaction = tf.zeros(shape=(action.shape[0], action.shape[1]), dtype=tf.int32)
+        if tf.math.count_nonzero(action_init).numpy() == 0:
+            pass
+        else:
+            _action = tf.gather_nd(aaction, action_index)
+            action = tf.tensor_scatter_nd_update(action, indices=action_index, updates=_action)
+
+        return action
+
+    def update(self, state0, action0, reward_, state1):
+        
+        Q_table_state1 = tf.gather_nd(self.Q_table, tf.concat([self.btach_tensor, state1], axis=1))
+        state1_max = tf.reduce_max(Q_table_state1, axis=1)
+        action0 = tf.reshape(action0, shape=(action0.shape[0],))
+        action0 = action0 + tf.ones(action0.shape[0], dtype=tf.int32)
+        action0 = tf.reshape(action0, shape=(action0.shape[0],1))
+        
+        indextensor = tf.concat([self.btach_tensor, state0, action0], axis=1)
+        Q_table_state0 = tf.gather_nd(self.Q_table, indextensor)
+
+        td_error = reward_ + self.gamma * state1_max - Q_table_state0
+        td_error = tf.reshape(td_error, shape=(td_error.shape[0],)) * self.alpha
+
+        zeros__ = tf.tensor_scatter_nd_update(self.zeros__, indices=indextensor, updates=td_error)
+        self.Q_table = self.Q_table + zeros__
+        return self.Q_table
+
+q = tf.random.uniform((100, 5, 128), minval=0, maxval=1, dtype=tf.float32)
+k = tf.random.uniform((100, 4, 128), minval=0, maxval=1, dtype=tf.float32)
+y_label = tf.random.uniform((100, 1), minval=0, maxval=10, dtype=tf.int32)
+
+num = 0.8
+epsilon = 0.1 
+alpha = 0.1
+gamma = 0.9 
+num_episodes = 500
+Qatt = Qattention(q=q, k=k, epsilon=epsilon, alpha=alpha, gamma=gamma, num=num
+                  , y_label=y_label)
+
+action__ = []
+score__ = []
+loss__ = []
+__ = []
+for i in range(10):
+    with tqdm(total=int(num_episodes / 10), desc="Iteration %d" % i) as pbar:  # 进度条的序列数
+        for i_episode in range(int(num_episodes / 10)):
+            episode_return = 0
+            state0, x, y, action_ind, action_init = Qatt.initstate()
+            init_score, init_loss, loss = Qatt.init_loss()
+            # statenum = state0 
+            done = False
+            while not done:
+                action = Qatt.take_action(state0, action_ind, action_init)
+                next_state, x, y = Qatt.getstate(state0, action_ind, x, y) # statenum 
+                reward_, next_score, next_loss, action_index, mean_loss, done = Qatt.reward(action, x, y, init_score
+                                                                                  , init_loss, action_ind)
+                Q_table = Qatt.update(state0, action, reward_, next_state)
+                
+                # print(Q_table, 'init_Q_table')
+                state0 = next_state
+                init_score, init_loss = next_score, next_loss
+                action_ind, action_init = action_index, action
+                # score__.append(next_score.numpy())
+                loss__.append(next_loss.numpy())
+                __.append(mean_loss.numpy())
+            # print(init_loss)
+            pbar.update(1)
+        # action__.append(Q_table.numpy())
+        # print(Q_table)
